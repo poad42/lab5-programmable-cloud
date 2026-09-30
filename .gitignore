@@ -1,0 +1,8 @@
+# Service account credentials (never commit these)
+service-credentials.json
+*-credentials.json
+*-key.json
+
+# Python
+__pycache__/
+*.pyc

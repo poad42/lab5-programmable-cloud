@@ -1,0 +1,15 @@
+services:
+  gcloud-lab:
+    build: .
+    container_name: lab5-cloud
+    restart: unless-stopped
+    volumes:
+      - ./:/lab
+      # Application Default Credentials from the host gcloud, read only.
+      - /home/adhitya/.config/gcloud/application_default_credentials.json:/adc.json:ro
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/adc.json
+      - GOOGLE_CLOUD_PROJECT=ardent-quarter-510218-a6
+      - CLOUDSDK_CORE_PROJECT=ardent-quarter-510218-a6
+    stdin_open: true
+    tty: true
