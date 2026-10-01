@@ -37,7 +37,16 @@ The lab suggests `f1-micro`, but `us-west1-b` had no capacity for `f1-micro`, `e
 - creates the image `lab5-base-image` from the snapshot,
 - creates `lab5-clone-1`, `lab5-clone-2`, and `lab5-clone-3` from the image, timing each creation.
 
-The timings are in `part2/TIMING.md`: 20.9 s, 9.5 s, 8.7 s, average 13.1 s. The first clone is slower because it fetches the new image's blocks for the first time. All three clones serve `Hello, World!` on port 5000.
+Measured creation times (also recorded in `part2/TIMING.md`):
+
+| Instance | Creation time (s) |
+|----------|-------------------|
+| `lab5-clone-1` | 20.9 |
+| `lab5-clone-2` | 9.5 |
+| `lab5-clone-3` | 8.7 |
+| Average | 13.1 |
+
+The first clone is slower because it fetches the new image's blocks for the first time. All three clones serve `Hello, World!` on port 5000.
 
 ### Why the instance is stopped first
 
