@@ -1,13 +1,15 @@
-# Part 2 - instance creation timings
+# Part 2 - instance creation and startup timings
 
 Image: `lab5-base-image` (from snapshot `base-snapshot-lab5-flask-vm` of `lab5-flask-vm`)
 
-Machine type: `n2d-standard-2`, zone `us-west1-b`
+Machine type: `e2-micro`, zone `us-west1-b`
 
-| Instance | Creation time (s) |
-|----------|-------------------|
-| `lab5-clone-1` | 20.9 |
-| `lab5-clone-2` | 9.5 |
-| `lab5-clone-3` | 8.7 |
+| Instance | Create operation (s) | App ready, from create request (s) |
+|----------|----------------------|----------------------------|
+| `lab5-clone-1` | 20.2 | 64.9 |
+| `lab5-clone-2` | 10.6 | 50.2 |
+| `lab5-clone-3` | 13.6 | 58.2 |
 
-Average: 13.1 s
+Average: create 14.8 s, application ready 57.8 s
+
+Snapshot creation: 75.7 s. Image creation: 127.3 s.

@@ -7,6 +7,9 @@ contains the service account key, a startup script for VM-2, and a Python
 program that creates VM-2. VM-1 then creates VM-2, which runs the Flask
 application from Part 1.
 
+The program times how long VM-1 takes to create, and how long VM-2 takes to
+become ready, measured from VM-2's creation timestamp.
+
 The service account is created outside this program with:
   gcloud iam service-accounts create lab5-vm-creator ...
   gcloud projects add-iam-policy-binding ... --role=roles/compute.instanceAdmin.v1
@@ -16,8 +19,11 @@ The service account is created outside this program with:
 See https://google-auth.readthedocs.io/en/latest/reference/google.oauth2.service_account.html
 """
 
+import datetime
 import os
 import time
+import urllib.error
+import urllib.request
 
 import googleapiclient.discovery
 import google.oauth2.service_account as service_account
@@ -27,9 +33,16 @@ ZONE = "us-west1-b"
 VM1_NAME = "lab5-launcher-vm"
 VM2_NAME = "lab5-appliance-vm"
 MACHINE_TYPE = "n2d-standard-2"
+# Cheapest first. The E2 and shared-core families are out of capacity in
+# us-west1-b at times, so the program falls back to an N2D/N2 machine type.
+MACHINE_TYPES = [
+    "f1-micro", "e2-micro", "e2-small", "e2-medium",
+    "n2d-standard-2", "n2-highcpu-2", "n2-standard-2",
+]
 IMAGE_FAMILY = "ubuntu-2604-lts-amd64"
 IMAGE_PROJECT = "ubuntu-os-cloud"
 CREDENTIALS_FILE = "service-credentials.json"
+APP_PORT = 5000
 
 # The startup script that VM-1 passes to VM-2. It installs and starts Flask.
 VM2_STARTUP_SCRIPT = r"""#!/bin/bash
@@ -155,14 +168,26 @@ def resource_exists(get_request):
         raise
 
 
-def machine_type_for_source(compute, project):
-    """Use the same cheap machine type that worked for the Part 1 VM."""
+def capacity_error(error):
+    """True when the zone cannot supply the machine type right now."""
+    text = str(error)
+    return ("resource_availability" in text or "stockout" in text or
+            "ZONE_RESOURCE_POOL_EXHAUSTED" in text)
+
+
+def machine_types_for_source(compute, project):
+    """Try the Part 1 VM's type first, then the other cheap types."""
+    types = []
     try:
         instance = compute.instances().get(
             project=project, zone=ZONE, instance="lab5-flask-vm").execute()
-        return instance["machineType"].split("/")[-1]
+        types.append(instance["machineType"].split("/")[-1])
     except HttpError:
-        return MACHINE_TYPE
+        pass
+    for machine_type in MACHINE_TYPES:
+        if machine_type not in types:
+            types.append(machine_type)
+    return types
 
 
 def create_vm1(compute, project, machine_type):
@@ -202,10 +227,29 @@ def create_vm1(compute, project, machine_type):
     return wait_for_operation(compute, project, operation)
 
 
-def get_external_ip(compute, project, name):
-    instance = compute.instances().get(
+def get_instance(compute, project, name):
+    return compute.instances().get(
         project=project, zone=ZONE, instance=name).execute()
-    return instance["networkInterfaces"][0]["accessConfigs"][0]["natIP"]
+
+
+def get_external_ip(compute, project, name):
+    return get_instance(compute, project, name)[
+        "networkInterfaces"][0]["accessConfigs"][0]["natIP"]
+
+
+def wait_for_app(ip, port=APP_PORT, timeout=900, interval=2):
+    """Poll the app until /hello answers, returning the seconds it took."""
+    start = time.time()
+    url = "http://%s:%d/hello" % (ip, port)
+    while time.time() - start < timeout:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                if response.status == 200:
+                    return time.time() - start
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(interval)
+    return None
 
 
 def main():
@@ -220,36 +264,71 @@ def main():
     print("Project: %s" % project)
     print("Service account: %s" % credentials.service_account_email)
 
-    machine_type = machine_type_for_source(compute, project)
-    print("Machine type: %s" % machine_type)
+    machine_types = machine_types_for_source(compute, project)
+    print("Machine type candidates: %s" % ", ".join(machine_types))
 
+    vm1_create_seconds = 0.0
+    machine_type = machine_types[0]
     if resource_exists(lambda: compute.instances().get(
             project=project, zone=ZONE, instance=VM1_NAME)):
         print("VM-1 %s already exists." % VM1_NAME)
     else:
-        print("Creating VM-1 %s (this VM creates VM-2)..." % VM1_NAME)
-        create_vm1(compute, project, machine_type)
-        print("VM-1 created.")
+        for machine_type in machine_types:
+            try:
+                print("Creating VM-1 %s as %s (this VM creates VM-2)..." %
+                      (VM1_NAME, machine_type))
+                start = time.time()
+                create_vm1(compute, project, machine_type)
+                vm1_create_seconds = time.time() - start
+                print("VM-1 created as %s in %.1f s." %
+                      (machine_type, vm1_create_seconds))
+                break
+            except RuntimeError as e:
+                if machine_type != machine_types[-1] and capacity_error(e):
+                    print("%s is out of capacity in %s" %
+                          (machine_type, ZONE))
+                    continue
+                raise
 
     print("Waiting for VM-1 to create VM-2...")
-    for _ in range(60):
-        if resource_exists(lambda: compute.instances().get(
-                project=project, zone=ZONE, instance=VM2_NAME)):
-            break
-        time.sleep(10)
-    else:
-        print("VM-2 has not appeared yet; check /var/log/startup-script.log "
-              "on %s." % VM1_NAME)
+    vm2 = None
+    for _ in range(120):
+        try:
+            candidate = get_instance(compute, project, VM2_NAME)
+            access_config = candidate["networkInterfaces"][0]["accessConfigs"][0]
+            if access_config.get("natIP"):
+                vm2 = candidate
+                break
+        except HttpError as e:
+            if e.resp.status != 404:
+                raise
+        time.sleep(5)
+    if vm2 is None:
+        print("VM-2 has not appeared with an external IP yet; check "
+              "/var/log/startup-script.log on %s." % VM1_NAME)
         return
 
-    ip = get_external_ip(compute, project, VM2_NAME)
+    created = datetime.datetime.fromisoformat(vm2["creationTimestamp"])
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=datetime.timezone.utc)
+    ip = vm2["networkInterfaces"][0]["accessConfigs"][0]["natIP"]
+    print("VM-1 created VM-2 at %s." % vm2["creationTimestamp"])
+
+    startup_seconds = wait_for_app(ip)
+    if startup_seconds is None:
+        print("VM-2 did not answer within the timeout.")
+        return
+    ready_at = datetime.datetime.now(datetime.timezone.utc)
+    vm2_total_seconds = (ready_at - created).total_seconds()
+
     print()
-    print("VM-1 created VM-2, which runs the Flask application.")
-    print("The startup script on VM-2 takes a minute or two to install Flask.")
+    print("VM-1 create operation: %.1f s" % vm1_create_seconds)
+    print("VM-2 application ready: %.1f s after VM-2's creation "
+          "timestamp" % vm2_total_seconds)
     print()
     print("The Flask application is available at:")
     print()
-    print("http://%s:5000" % ip)
+    print("http://%s:%d" % (ip, APP_PORT))
 
 
 if __name__ == "__main__":

@@ -6,13 +6,16 @@ The program uses the Compute Engine API to:
   * pass a startup script that installs and starts the Flask app,
   * create the allow-5000 firewall rule if it does not exist,
   * tag the VM so the firewall rule applies to it,
-  * print the URL of the running application.
+  * print the URL of the running application and how long it took to
+    become ready.
 
 Adapted from the Google Cloud "create_instance.py" sample:
 https://github.com/GoogleCloudPlatform/python-docs-samples/blob/main/compute/api/create_instance.py
 """
 
 import time
+import urllib.error
+import urllib.request
 
 import googleapiclient.discovery
 import google.auth
@@ -55,9 +58,9 @@ python3 -m venv /srv/venv
 /srv/venv/bin/pip install -e .
 
 export FLASK_APP=flaskr
-/srv/venv/bin/flask init-db
+/srv/venv/bin/python -m flask init-db
 
-nohup /srv/venv/bin/flask run -h 0.0.0.0 --port 5000 > /var/log/flask.log 2>&1 &
+nohup /srv/venv/bin/python -m flask run -h 0.0.0.0 --port 5000 > /var/log/flask.log 2>&1 &
 """
 
 
@@ -103,6 +106,13 @@ def instance_exists(compute, project, zone, name):
         if e.resp.status == 404:
             return False
         raise
+
+
+def capacity_error(error):
+    """True when the zone cannot supply the machine type right now."""
+    text = str(error)
+    return ("resource_availability" in text or "stockout" in text or
+            "ZONE_RESOURCE_POOL_EXHAUSTED" in text)
 
 
 def create_instance(compute, project, zone, name, machine_type, image):
@@ -179,6 +189,21 @@ def get_external_ip(compute, project, zone, name):
     return instance["networkInterfaces"][0]["accessConfigs"][0]["natIP"]
 
 
+def wait_for_app(ip, port=APP_PORT, timeout=900, interval=2):
+    """Poll the app until /hello answers, returning the seconds it took."""
+    start = time.time()
+    url = "http://%s:%d/hello" % (ip, port)
+    while time.time() - start < timeout:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                if response.status == 200:
+                    return time.time() - start
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(interval)
+    return None
+
+
 def main():
     credentials, project = google.auth.default()
     compute = googleapiclient.discovery.build(
@@ -193,24 +218,28 @@ def main():
     else:
         print("Firewall rule %s already exists." % FIREWALL_RULE)
 
+    create_seconds = 0.0
     if not instance_exists(compute, project, ZONE, INSTANCE_NAME):
         image = get_image_from_family(compute, IMAGE_PROJECT, IMAGE_FAMILY)
+        create_start = time.time()
         for machine_type in MACHINE_TYPES:
             try:
                 print("Creating instance %s (%s) from %s..." %
                       (INSTANCE_NAME, machine_type, image["name"]))
                 create_instance(compute, project, ZONE, INSTANCE_NAME,
                                 machine_type, image)
-                print("Created %s as %s" % (INSTANCE_NAME, machine_type))
+                create_seconds = time.time() - create_start
+                print("Created %s as %s in %.1f s" %
+                      (INSTANCE_NAME, machine_type, create_seconds))
                 break
             except RuntimeError as e:
-                if machine_type != MACHINE_TYPES[-1] and \
-                        "resource_availability" in str(e):
+                if machine_type != MACHINE_TYPES[-1] and capacity_error(e):
                     print("%s is out of capacity in %s" % (machine_type, ZONE))
                     continue
                 raise
     else:
         print("Instance %s already exists." % INSTANCE_NAME)
+        create_start = time.time()
 
     print("Applying network tag %s..." % TAG)
     set_tags(compute, project, ZONE, INSTANCE_NAME, [TAG])
@@ -221,7 +250,18 @@ def main():
     print()
     print("http://%s:%d" % (ip, APP_PORT))
     print()
-    print("The startup script takes a minute or two to install Flask.")
+    print("Waiting for the startup script to install Flask...")
+
+    startup_seconds = wait_for_app(ip)
+    if startup_seconds is None:
+        print("The application did not answer within the timeout.")
+        return
+    total_seconds = time.time() - create_start
+    print()
+    print("Instance create operation: %.1f s" % create_seconds)
+    print("Application ready: %.1f s after the create request (%.1f s "
+          "after the create operation finished)" %
+          (total_seconds, total_seconds - create_seconds))
 
 
 if __name__ == "__main__":

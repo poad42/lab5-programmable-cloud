@@ -17,15 +17,25 @@ All runs use the project `ardent-quarter-510218-a6`, zone `us-west1-b`, and the 
 - checks for the `allow-5000` firewall rule and creates it when missing (TCP port 5000 from `0.0.0.0/0`, target tag `allow-5000`),
 - creates `lab5-flask-vm` with an `ONE_TO_ONE_NAT` external IP and a startup script,
 - applies the `allow-5000` network tag with `instances.setTags`,
-- reads the external IP from the instance and prints the URL.
+- reads the external IP, prints the URL, and times how long the application takes to answer.
 
 The startup script installs `python3`, `python3-pip`, `python3-venv`, and `git`, clones the flask-tutorial repository, installs it into a venv, runs `flask init-db`, and starts `flask run -h 0.0.0.0 --port 5000`.
 
-Result: `http://136.109.234.185:5000/hello` returns `Hello, World!`.
+Result: `http://8.229.169.154:5000/hello` returns `Hello, World!`.
 
-### Machine type
+### Machine type and capacity
 
-The lab suggests `f1-micro`, but `us-west1-b` had no capacity for `f1-micro`, `e2-micro`, `e2-small`, or `e2-medium` (`ZONE_RESOURCE_POOL_EXHAUSTED`). The program tries those cheapest types first and falls back to `n2d-standard-2`, the cheapest type the zone accepted. Every VM in this lab ran as `n2d-standard-2`.
+The lab suggests `f1-micro`. Capacity for the cheap families in `us-west1-b` comes and goes during the run: at different points `f1-micro`, `e2-micro`, `e2-small`, and `e2-medium` all returned `ZONE_RESOURCE_POOL_EXHAUSTED` or `stockout`. The program tries those cheapest types first and falls back to `n2d-standard-2`. The Part 1 run used `e2-micro` (2 shared vCPU, 1 GB). The Part 3 run fell through to `n2d-standard-2` (2 vCPU, 8 GB).
+
+### Part 1 timings
+
+| Measurement | Time |
+|-------------|------|
+| Instance create operation | 23.2 s |
+| Application ready, from the create request | 416.9 s |
+| Application ready, after the create operation finished | 393.7 s |
+
+The 394 s is the time for the startup script to run apt, clone the repository, build the venv, install Flask, and start it, on a shared-core `e2-micro`. On the dedicated `n2d-standard-2` that Part 3 used, the same install took 73.3 s, so the machine type dominates this number.
 
 ## Part 2 - clone a machine
 
@@ -35,18 +45,23 @@ The lab suggests `f1-micro`, but `us-west1-b` had no capacity for `f1-micro`, `e
 - creates the snapshot `base-snapshot-lab5-flask-vm` from the boot disk,
 - starts the instance again,
 - creates the image `lab5-base-image` from the snapshot,
-- creates `lab5-clone-1`, `lab5-clone-2`, and `lab5-clone-3` from the image, timing each creation.
+- creates `lab5-clone-1`, `lab5-clone-2`, and `lab5-clone-3` from the image, timing the create operation and the time until each clone serves the application.
 
-Measured creation times (also recorded in `part2/TIMING.md`):
+| Step | Time |
+|------|------|
+| Snapshot creation | 75.7 s |
+| Image creation | 127.3 s |
 
-| Instance | Creation time (s) |
-|----------|-------------------|
-| `lab5-clone-1` | 20.9 |
-| `lab5-clone-2` | 9.5 |
-| `lab5-clone-3` | 8.7 |
-| Average | 13.1 |
+| Instance | Create operation (s) | App ready, from create request (s) |
+|----------|----------------------|----------------------------|
+| `lab5-clone-1` | 20.2 | 64.9 |
+| `lab5-clone-2` | 10.6 | 50.2 |
+| `lab5-clone-3` | 13.6 | 58.2 |
+| Average | 14.8 | 57.8 |
 
-The first clone is slower because it fetches the new image's blocks for the first time. All three clones serve `Hello, World!` on port 5000.
+The clones are `e2-micro` and boot from the image with Flask already installed, so their startup script only launches the application. The 50 to 65 s is mostly VM boot plus the application launch, not installation. All three clones serve `Hello, World!` on port 5000.
+
+The same numbers are recorded in `part2/TIMING.md`.
 
 ### Why the instance is stopped first
 
@@ -63,11 +78,28 @@ The service account `lab5-vm-creator@ardent-quarter-510218-a6.iam.gserviceaccoun
 - installs the Google API client into a venv,
 - runs the launcher, which creates VM-2 (`lab5-appliance-vm`) with the Flask startup script.
 
-VM-1's startup log ends with `VM-1 requested VM-2: lab5-appliance-vm`. VM-2 serves the application at `http://8.229.24.225:5000/hello`.
+| Measurement | Time |
+|-------------|------|
+| VM-1 create operation | 9.7 s |
+| VM-2 application ready, from VM-2's creation timestamp | 73.3 s |
+
+VM-1's startup log ends with `VM-1 requested VM-2: lab5-appliance-vm`. VM-2 serves the application at `http://34.82.215.132:5000/hello`.
+
+Both VMs ran as `n2d-standard-2` for this run, which is why VM-2's install took 73.3 s rather than the 394 s the shared-core Part 1 VM needed.
 
 ### Why VM-1 uses a venv
 
 The first VM-1 startup script ran `pip3 install --break-system-packages google-api-python-client`. That failed because pip tried to replace the Debian-managed `requests` package (`uninstall-no-record-file`). A venv avoids the conflict.
+
+## Application startup summary
+
+| Part | Machine type | What the startup script does | App ready |
+|------|--------------|------------------------------|-----------|
+| 1 | `e2-micro` | installs Flask from scratch | 416.9 s from the create request |
+| 2 | `e2-micro` | launches the pre-installed app | 50.2 to 64.9 s from the create request |
+| 3 | `n2d-standard-2` | installs Flask from scratch | 73.3 s from VM-2's creation timestamp |
+
+The install steps dominate. Running apt, a git clone, a venv build, and a pip install costs about 400 s on the 2-shared-vCPU, 1 GB `e2-micro`, and about 73 s on the dedicated `n2d-standard-2`. Booting from an image that already contains the application costs about a minute on either type.
 
 ## Software needed
 
@@ -114,13 +146,14 @@ gcloud iam service-accounts keys create service-credentials.json \
 
 | Part | Resource | Result |
 |------|----------|--------|
-| 1 | `lab5-flask-vm` | `http://136.109.234.185:5000/hello` returns `Hello, World!` |
-| 2 | `base-snapshot-lab5-flask-vm`, `lab5-base-image`, three clones | 20.9 s, 9.5 s, 8.7 s, average 13.1 s |
-| 3 | `lab5-launcher-vm` creates `lab5-appliance-vm` | `http://8.229.24.225:5000/hello` returns `Hello, World!` |
+| 1 | `lab5-flask-vm` | create 23.2 s, app ready 416.9 s, `/hello` returns `Hello, World!` |
+| 2 | `base-snapshot-lab5-flask-vm`, `lab5-base-image`, three clones | snapshot 75.7 s, image 127.3 s, clones create 14.8 s average, app ready 57.8 s average |
+| 3 | `lab5-launcher-vm` creates `lab5-appliance-vm` | VM-1 create 9.7 s, VM-2 app ready 73.3 s, `/hello` returns `Hello, World!` |
 
 ## Notes and caveats
 
-- Every VM ran as `n2d-standard-2` because the E2 and shared-core families were out of capacity in `us-west1-b`.
+- Capacity for the cheap families in `us-west1-b` fluctuates, so every program tries the cheapest machine type first and falls back to the next one. The runs used `e2-micro` for Parts 1 and 2 and `n2d-standard-2` for Part 3.
+- The application startup time depends mostly on whether the startup script installs Flask or only launches it, and on the machine type when it installs. The shared-core `e2-micro` was about five times slower at the install than the dedicated `n2d-standard-2`.
 - The service account key is passed to VM-1 through instance metadata, which any principal with project read access can see. The lab notes this tradeoff. The key is gitignored, and it was deleted with the service account after the runs.
 - Ubuntu 26.04 ships Python 3.14 and marks the system Python as externally managed, so the startup scripts install into venvs.
 - The flask-tutorial repository pins no Flask version, so pip installs a current Flask (3.1.3) that runs on Python 3.14.
